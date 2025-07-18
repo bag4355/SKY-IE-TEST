@@ -55,6 +55,8 @@ def build_model(*, daily: bool = True, threads: int = 32):
     m.Params.Threads = threads
     m.Params.MIPGap  = 0.03
 
+    BLOCKS = range(math.ceil(len(WEEKS) / MODE_BLOCK_WEEKS))
+
     # ═══════════════ 0. FACILITY VARIABLES ════════════════════════════════
     openF = m.addVars(dp.FACTORIES, vtype=GRB.BINARY, name="OpenF")
     openW = m.addVars(dp.WAREHOUSES, vtype=GRB.BINARY, name="OpenW")
@@ -154,12 +156,33 @@ def build_model(*, daily: bool = True, threads: int = 32):
     # mode‑usage indicator (edge, day, mode)  – ensures **single mode / day**
     modeUsed = m.addVars(TSET, [(f, h) for f, h, _ in dp.edges_FC_WH],
                          MODES_FCWH, vtype=GRB.BINARY, name="EdgeModeDay")
+    # 4‑week mode locking structure
+    edges = [(f, h) for f, h, _ in dp.edges_FC_WH]
+    modeBlock = m.addVars(BLOCKS, range(7), edges, MODES_FCWH,
+                          vtype=GRB.BINARY, name="ModeBlock")
+    modeChange = m.addVars(BLOCKS, range(7), edges,
+                           vtype=GRB.BINARY, name="ModeChange")
+
+    for b in BLOCKS:
+        for dow in range(7):
+            for e in edges:
+                m.addConstr(gp.quicksum(modeBlock[b, dow, e, mn]
+                                       for mn in MODES_FCWH) <= 1)
+
+    def block_idx(t):
+        idx = WEEKS.index(week_monday(t).to_period("W-MON")) if daily else WEEKS.index(t)
+        return idx // MODE_BLOCK_WEEKS
+
+    def dow_of(t):
+        return t.weekday() if daily else 0
 
     for t in TSET:
+        b = block_idx(t)
+        dow = dow_of(t)
         for f, h in {(f, h) for f, h, _ in dp.edges_FC_WH}:
             # only one mode may be >0
             m.addConstr(gp.quicksum(modeUsed[t, (f, h), m]
-                        for m in MODES_FCWH) <= 1,
+                                   for m in MODES_FCWH) <= 1,
                         name=f"SingleMode_{t}_{f}_{h}")
             for mname in MODES_FCWH:
                 if (f, h, mname) not in dp.edges_FC_WH:
@@ -167,12 +190,48 @@ def build_model(*, daily: bool = True, threads: int = 32):
                 # binding: Ship > 0 ⇒ modeUsed = 1
                 m.addConstr(Ship_F2W[t, (f, h, mname)] <=
                             BIG_M * modeUsed[t, (f, h), mname])
+                m.addConstr(modeUsed[t, (f, h), mname] <= modeBlock[b, dow, (f, h), mname])
                 # logical open sites
                 wh_week = week_monday(t).to_period("W-MON") if daily else t
                 m.addConstr(Ship_F2W[t, (f, h, mname)] <=
                             BIG_M * actF[wh_week, f])
                 m.addConstr(Ship_F2W[t, (f, h, mname)] <=
                             BIG_M * actW[wh_week, h])
+
+    # mode change indicator
+    ChangeCost = m.addVars(BLOCKS, range(7), edges, vtype=GRB.CONTINUOUS, lb=0,
+                           name="ChangeCost")
+    change_cost = gp.LinExpr()
+    for b in BLOCKS:
+        if b == 0:
+            continue
+        for dow in range(7):
+            for e in edges:
+                for mn in MODES_FCWH:
+                    m.addConstr(modeChange[b, dow, e] >= modeBlock[b, dow, e, mn] - modeBlock[b-1, dow, e, mn])
+                    m.addConstr(modeChange[b, dow, e] >= modeBlock[b-1, dow, e, mn] - modeBlock[b, dow, e, mn])
+                m.addConstr(modeChange[b, dow, e] <= gp.quicksum(modeBlock[b, dow, e, mn] + modeBlock[b-1, dow, e, mn]
+                                                               for mn in MODES_FCWH))
+
+                # 5 % penalty based on previous block cost
+                prev_cost = gp.LinExpr()
+                for t in TSET:
+                    if block_idx(t) == b - 1 and dow_of(t) == dow:
+                        for mn in MODES_FCWH:
+                            if (e[0], e[1], mn) not in dp.edges_FC_WH:
+                                continue
+                            multi = 1.0
+                            if (isinstance(t, dt.date) and t in dp.BAD_WEATHER_DATES):
+                                multi *= 3
+                            if week_monday(t if isinstance(t, dt.date) else t.start_time.date()).to_period("W-MON") in dp.HIGH_OIL_WEEKS:
+                                multi *= 2
+                            prev_cost += (dp.COST_FC_WH[e[0], e[1], mn] + dp.BORDER_FC_WH[e[0], e[1]]) * multi * Ship_F2W[t, (e[0], e[1], mn)]
+
+                m.addConstr(ChangeCost[b, dow, e] >= 0.05 * prev_cost - BIG_M * (1 - modeChange[b, dow, e]))
+                m.addConstr(ChangeCost[b, dow, e] <= 0.05 * prev_cost + BIG_M * (1 - modeChange[b, dow, e]))
+                m.addConstr(ChangeCost[b, dow, e] <= BIG_M * modeChange[b, dow, e])
+
+    change_cost += gp.quicksum(ChangeCost[b, dow, e] for b in BLOCKS for dow in range(7) for e in edges)
 
     # ── Warehouse → City (TRUCK only) ──────────────────────────────────────
     Ship_W2C = m.addVars(TSET, dp.edges_WH_CT, vtype=GRB.INTEGER, lb=0,
@@ -226,23 +285,25 @@ def build_model(*, daily: bool = True, threads: int = 32):
                         arrivals += Ship_F2W[src_w, (f, h, mname)] * CONTAINER_CAP
 
                 # Demand of the week
-                dem = 0
-                for d in (daterange(w.start_time.date(),
-                                    w.start_time.date()+dt.timedelta(6))):
-                    dem += dp.DEMAND_DICT.get((d, s, c), 0)  \
-                           if (h, (c := dp.iso_city.get(c))) in dp.edges_WH_CT else 0
-                m.addConstr(dem - Short[w, h, s] <=
+                demand = gp.quicksum(
+                    dp.DEMAND_DICT.get((d, s, city), 0)
+                    for d in daterange(w.start_time.date(),
+                                       w.start_time.date() + dt.timedelta(6))
+                    for city in dp.CITIES
+                    if (h, city) in dp.edges_WH_CT
+                )
+                m.addConstr(demand - Short[w, h, s] <=
                             Inv[w, h, s, 0] + arrivals,
                             name=f"DemandSat_{w}_{h}_{s}")
 
                 # Fill‑Rate
-                if dem > 0:
-                    m.addConstr(Short[w, h, s] <= 0.05 * dem)
+                if demand > 0:
+                    m.addConstr(Short[w, h, s] <= 0.05 * demand)
 
                 # Ageing
                 if w_idx + 1 < len(WEEKS):
                     nxt = WEEKS[w_idx+1]
-                    m.addConstr(Inv[nxt, h, s, 0] == arrivals)
+                    m.addConstr(Inv[nxt, h, s, 0] == available - dispatch)
                     life = dp.life_weeks[s]
                     for a in range(life):
                         m.addConstr(Inv[nxt, h, s, a+1] ==
@@ -282,7 +343,7 @@ def build_model(*, daily: bool = True, threads: int = 32):
     #  this builder file lean.)
 
     # Placeholder objective (updated in run‑module)
-    m.setObjective(capex + prod_cost + trans_cost +
+    m.setObjective(capex + prod_cost + trans_cost + change_cost +
                    inv_cost + short_cost +
                    TON_PENALTY_USD * ceil_div_expr(co2_prod + co2_tran))
 
@@ -292,8 +353,9 @@ def build_model(*, daily: bool = True, threads: int = 32):
         ProdR=ProdR, ProdO=ProdO,
         ShipF2W=Ship_F2W, ShipW2C=Ship_W2C,
         Inv=Inv, Short=Short, Scrap=Scrap,
-        modeUsed=modeUsed,
+        modeUsed=modeUsed, modeBlock=modeBlock, modeChange=modeChange,
         cost_terms=dict(capex=capex, prod=prod_cost, trans=trans_cost,
+                        change=change_cost,
                         inv=inv_cost, short=short_cost,
                         co2p=co2_prod, co2t=co2_tran)
     )
